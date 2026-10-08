@@ -1,0 +1,64 @@
+name: payment-processor
+x-app: &app
+  build: .
+  environment: &environment
+    API_KEY: ${API_KEY:?Copy .env.example to .env first}
+    DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+    RABBITMQ_URL: amqp://payments:payments@rabbitmq:5672/
+    RETRY_BASE_DELAY: ${RETRY_BASE_DELAY:-2}
+    WEBHOOK_TIMEOUT: ${WEBHOOK_TIMEOUT:-10}
+    OUTBOX_POLL_INTERVAL: ${OUTBOX_POLL_INTERVAL:-0.5}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  restart: unless-stopped
+  init: true
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+      POSTGRES_DB: payments
+    ports: ["127.0.0.1:55432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: payments
+      RABBITMQ_DEFAULT_PASS: payments
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 2:2"
+      RABBITMQ_CTL_ERL_ARGS: "+S 1:1"
+    ports: ["127.0.0.1:5672:5672", "127.0.0.1:15672:15672"]
+    volumes: ["rabbitmq_data:/var/lib/rabbitmq"]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  api:
+    <<: *app
+    command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen(urllib.request.Request('http://localhost:8000/health', headers={'X-API-Key': os.environ['API_KEY']}))"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+  consumer:
+    <<: *app
+    command: ["faststream", "run", "app.workers.consumer:app"]
+    stop_grace_period: 30s
+    depends_on:
+      api: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+volumes:
+  postgres_data:
+  rabbitmq_data:
